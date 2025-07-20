@@ -10,10 +10,13 @@ import {
   Platform,
 } from "react-native";
 
+import { useLocalSearchParams } from "expo-router";
 export default function Products() {
+
   const [products, setProducts] = useState<string[]>([]);
   const [productName, setProductName] = useState("");
 
+  const { image } = useLocalSearchParams();
   const addProduct = () => {
     if (productName.trim()) {
       setProducts([...products, productName]);
