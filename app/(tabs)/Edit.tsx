@@ -11,6 +11,9 @@ import {
   ActivityIndicator,
   Modal,
   Alert,
+  Animated,
+  Easing,
+  ScrollView,
 } from "react-native";
 import { Image as ExpoImage } from "expo-image";
 import { Ionicons } from "@expo/vector-icons";
@@ -44,11 +47,26 @@ export default function Products() {
   const [savedImages, setSavedImages] = useState<string[]>([]);
   const [galleryOpen, setGalleryOpen] = useState(false);
 
-  // ✅ text detection state: "unknown" | "text" | "no-text"
+  // text detection
   const [textStatus, setTextStatus] = useState<"unknown" | "text" | "no-text">(
     "unknown"
   );
   const [scanning, setScanning] = useState(false);
+
+  // extracted OCR text
+  const [extractedText, setExtractedText] = useState("");
+
+  // 🆕 parsed items from OCR text
+  const [parsedItems, setParsedItems] = useState<
+    { name: string; qty: number; price: number }[]
+  >([]);
+
+  // pull-to-refresh
+  const [refreshing, setRefreshing] = useState(false);
+  const wave1 = useRef(new Animated.Value(0)).current;
+  const wave2 = useRef(new Animated.Value(0)).current;
+  const wave3 = useRef(new Animated.Value(0)).current;
+  const waveLoopRef = useRef<Animated.CompositeAnimation | null>(null);
 
   // prevent duplicate alerts per image
   const lastWarnedUriRef = useRef<string | undefined>(undefined);
@@ -68,15 +86,16 @@ export default function Products() {
     })();
   }, []);
 
-  // when a new image arrives, show it (don't save yet; we save only if it passes text check)
+  // when a new image arrives, show it (save only if passes text check)
   useEffect(() => {
     if (!imageUriFromNav) return;
     setPreviewUri(imageUriFromNav);
     setImgLoading(true);
     setTextStatus("unknown");
+    setExtractedText("");
   }, [imageUriFromNav]);
 
-  // helpers to keep gallery in sync
+  // keep gallery in sync
   const ensureInGallery = (uri: string) => {
     setSavedImages((prev) => {
       if (prev.includes(uri)) return prev;
@@ -95,12 +114,13 @@ export default function Products() {
     });
   };
 
-  // ✅ OCR check: green if text found, red if not
+  // OCR check + text store
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
       if (!previewUri) {
         setTextStatus("unknown");
+        setExtractedText("");
         return;
       }
       try {
@@ -128,19 +148,20 @@ export default function Products() {
         });
 
         const json = await res.json();
-        const text = json?.ParsedResults?.[0]?.ParsedText?.toString?.() ?? "";
+        const textRaw =
+          json?.ParsedResults?.[0]?.ParsedText?.toString?.() ?? "";
+        const cleanedText = textRaw.replace(/\r\n/g, "\n").trim();
 
-        const hasText = text.replace(/\s+/g, "").length >= 6;
+        const hasText = cleanedText.replace(/\s+/g, "").length >= 6;
 
         if (cancelled) return;
 
         setTextStatus(hasText ? "text" : "no-text");
+        setExtractedText(hasText ? cleanedText : "");
 
         if (hasText) {
-          // ✅ only save if text exists
           ensureInGallery(previewUri);
         } else {
-          // ❌ do not save; remove if present and alert once
           removeFromGallery(previewUri);
           if (lastWarnedUriRef.current !== previewUri) {
             lastWarnedUriRef.current = previewUri;
@@ -149,7 +170,10 @@ export default function Products() {
         }
       } catch (e) {
         console.log("OCR check error:", e);
-        if (!cancelled) setTextStatus("unknown");
+        if (!cancelled) {
+          setTextStatus("unknown");
+          setExtractedText("");
+        }
       } finally {
         if (!cancelled) setScanning(false);
       }
@@ -159,6 +183,86 @@ export default function Products() {
       cancelled = true;
     };
   }, [previewUri]);
+
+  // 🆕 parse extracted text into structured items (Product, Qty, Price)
+  useEffect(() => {
+    if (!extractedText) {
+      setParsedItems([]);
+      return;
+    }
+
+    const lines = extractedText
+      .split("\n")
+      .map((l) => l.replace(/\s+/g, " ").trim())
+      .filter((l) => l.length > 0);
+
+    const items: { name: string; qty: number; price: number }[] = [];
+
+    const toNumber = (s: string) => {
+      // normalize commas as thousands; keep dot decimals
+      const normalized = s.replace(/[^0-9.,]/g, "");
+      // if both , and ., remove commas (common thousands)
+      if (normalized.includes(".") && normalized.includes(",")) {
+        return parseFloat(normalized.replace(/,/g, ""));
+      }
+      // if only comma, treat it as decimal
+      if (!normalized.includes(".") && normalized.includes(",")) {
+        return parseFloat(normalized.replace(/,/g, "."));
+      }
+      return parseFloat(normalized);
+    };
+
+    const parseLine = (line: string) => {
+      // drop leading index like "1) " or "1. "
+      line = line.replace(/^\d+[\).]\s*/, "");
+
+      // try: name ... qty ... price(end)
+      // find price at end
+      const priceMatch = line.match(/(?:₹|\$|€)?\s?(\d+(?:[.,]\d{2})?)\s*$/);
+      if (!priceMatch) return null;
+      const priceVal = toNumber(priceMatch[1]);
+      if (!isFinite(priceVal)) return null;
+
+      const left = line.slice(0, priceMatch.index).trim();
+
+      // qty patterns: "qty: 2", "x2", "2 pcs", trailing integer
+      let qty = 1;
+      let namePart = left;
+
+      const qtyRegexes = [
+        /\bqty[:\-]?\s*(\d+)\b/i,
+        /\bquantity[:\-]?\s*(\d+)\b/i,
+        /\bx\s*(\d+)\b/i,
+        /(\d+)\s*(pcs|pieces|pk|pack|ct)\b/i,
+        /(\d+)\s*$/i,
+      ];
+
+      for (const rx of qtyRegexes) {
+        const m = left.match(rx);
+        if (m) {
+          const q = parseInt(m[1], 10);
+          if (isFinite(q) && q > 0 && q < 10000) {
+            qty = q;
+            namePart = left.slice(0, m.index).trim();
+            break;
+          }
+        }
+      }
+
+      // clean name
+      namePart = namePart.replace(/[-–•:*|]+$/g, "").trim();
+      if (!namePart || namePart.length < 2) return null;
+
+      return { name: namePart, qty, price: priceVal };
+    };
+
+    for (const l of lines) {
+      const item = parseLine(l);
+      if (item) items.push(item);
+    }
+
+    setParsedItems(items);
+  }, [extractedText]);
 
   const addProduct = () => {
     if (productName.trim()) {
@@ -181,6 +285,48 @@ export default function Products() {
     ]);
   };
 
+  const onRefresh = async () => {
+    setRefreshing(true);
+    try {
+      const raw = await AsyncStorage.getItem(IMAGES_KEY);
+      setSavedImages(raw ? JSON.parse(raw) : []);
+    } catch (e) {
+      console.log("refresh error:", e);
+    } finally {
+      setTimeout(() => setRefreshing(false), 650);
+    }
+  };
+
+  useEffect(() => {
+    const pulse = (val: Animated.Value) =>
+      Animated.sequence([
+        Animated.timing(val, {
+          toValue: 1,
+          duration: 350,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(val, {
+          toValue: 0,
+          duration: 350,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]);
+
+    if (refreshing) {
+      waveLoopRef.current = Animated.loop(
+        Animated.stagger(120, [pulse(wave1), pulse(wave2), pulse(wave3)])
+      );
+      waveLoopRef.current.start();
+    } else {
+      waveLoopRef.current?.stop?.();
+      wave1.setValue(0);
+      wave2.setValue(0);
+      wave3.setValue(0);
+    }
+  }, [refreshing, wave1, wave2, wave3]);
+
   const borderColor =
     textStatus === "text"
       ? "#22c55e"
@@ -194,6 +340,11 @@ export default function Products() {
       : textStatus === "no-text"
         ? styles.redGlow
         : undefined;
+
+  const barScale = (v: Animated.Value) =>
+    v.interpolate({ inputRange: [0, 1], outputRange: [0.75, 1.3] });
+  const barOpacity = (v: Animated.Value) =>
+    v.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1] });
 
   return (
     <KeyboardAvoidingView
@@ -221,6 +372,39 @@ export default function Products() {
         </TouchableOpacity>
       </View>
 
+      {/* Wave loader while refreshing */}
+      {refreshing && (
+        <View style={styles.waveWrap}>
+          <Animated.View
+            style={[
+              styles.waveBar,
+              {
+                transform: [{ scaleY: barScale(wave1) }],
+                opacity: barOpacity(wave1),
+              },
+            ]}
+          />
+          <Animated.View
+            style={[
+              styles.waveBar,
+              {
+                transform: [{ scaleY: barScale(wave2) }],
+                opacity: barOpacity(wave2),
+              },
+            ]}
+          />
+          <Animated.View
+            style={[
+              styles.waveBar,
+              {
+                transform: [{ scaleY: barScale(wave3) }],
+                opacity: barOpacity(wave3),
+              },
+            ]}
+          />
+        </View>
+      )}
+
       {/* Large preview with text/no-text border */}
       {!!previewUri && (
         <View style={[styles.previewWrap, { borderColor }, glowStyle]}>
@@ -245,6 +429,45 @@ export default function Products() {
         </View>
       )}
 
+      {/* Extracted text (scrollable) */}
+      {extractedText.length > 0 && (
+        <View style={styles.ocrBox}>
+          <Text style={styles.ocrTitle}>Extracted text</Text>
+          <ScrollView
+            style={styles.ocrScroll}
+            contentContainerStyle={{ paddingRight: 6 }}
+            showsVerticalScrollIndicator
+          >
+            <Text style={styles.ocrText}>{extractedText}</Text>
+          </ScrollView>
+        </View>
+      )}
+
+      {/* 🆕 Parsed “Product DB” table */}
+      {parsedItems.length > 0 && (
+        <View style={styles.tableWrap}>
+          <View style={styles.tableHeader}>
+            <Text style={[styles.th, styles.colName]}>Product</Text>
+            <Text style={[styles.th, styles.colQty]}>Qty</Text>
+            <Text style={[styles.th, styles.colPrice]}>Price</Text>
+          </View>
+
+          <ScrollView style={styles.tableScroll} showsVerticalScrollIndicator>
+            {parsedItems.map((it, idx) => (
+              <View key={idx} style={styles.tr}>
+                <Text style={[styles.td, styles.colName]} numberOfLines={1}>
+                  {it.name}
+                </Text>
+                <Text style={[styles.td, styles.colQty]}>{it.qty}</Text>
+                <Text style={[styles.td, styles.colPrice]}>
+                  {isFinite(it.price) ? it.price.toFixed(2) : "-"}
+                </Text>
+              </View>
+            ))}
+          </ScrollView>
+        </View>
+      )}
+
       <FlatList
         data={products}
         keyExtractor={(item, index) => index.toString()}
@@ -255,6 +478,8 @@ export default function Products() {
           </View>
         )}
         contentContainerStyle={{ paddingBottom: 80 }}
+        refreshing={refreshing}
+        onRefresh={onRefresh}
       />
 
       <View style={styles.inputContainer}>
@@ -308,7 +533,23 @@ export default function Products() {
                       setPreviewUri(item);
                       setGalleryOpen(false);
                     }}
-                    onLongPress={() => removeImage(item)}
+                    onLongPress={() => {
+                      Alert.alert(
+                        "Remove photo?",
+                        "This will delete it from the gallery list.",
+                        [
+                          { text: "Cancel", style: "cancel" },
+                          {
+                            text: "Remove",
+                            style: "destructive",
+                            onPress: () => {
+                              removeFromGallery(item);
+                              if (previewUri === item) setPreviewUri(undefined);
+                            },
+                          },
+                        ]
+                      );
+                    }}
                     style={{ flex: 1 }}
                   >
                     <ExpoImage
@@ -319,9 +560,24 @@ export default function Products() {
                     />
                   </TouchableOpacity>
 
-                  {/* NEW: delete button overlay */}
                   <TouchableOpacity
-                    onPress={() => removeImage(item)}
+                    onPress={() => {
+                      Alert.alert(
+                        "Remove photo?",
+                        "This will delete it from the gallery list.",
+                        [
+                          { text: "Cancel", style: "cancel" },
+                          {
+                            text: "Remove",
+                            style: "destructive",
+                            onPress: () => {
+                              removeFromGallery(item);
+                              if (previewUri === item) setPreviewUri(undefined);
+                            },
+                          },
+                        ]
+                      );
+                    }}
                     style={styles.trashBtn}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                   >
@@ -344,7 +600,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 12,
+    marginBottom: 8,
   },
   header: { fontSize: 24, fontWeight: "bold" },
   galleryBtn: { padding: 4 },
@@ -361,6 +617,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   badgeText: { color: "#fff", fontSize: 10, fontWeight: "700" },
+
+  /* wave loader */
+  waveWrap: {
+    height: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    marginBottom: 8,
+  },
+  waveBar: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: "#1e90ff",
+  },
 
   // preview wrapper with border/glow
   previewWrap: {
@@ -402,6 +674,54 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   scanLabel: { fontSize: 12, color: "#4b5563" },
+
+  /* OCR output box */
+  ocrBox: {
+    backgroundColor: "#f9fafb",
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+  },
+  ocrTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 6,
+    color: "#111827",
+  },
+  ocrScroll: { maxHeight: 220 },
+  ocrText: { fontSize: 13, color: "#374151", lineHeight: 18 },
+
+  /* 🆕 Parsed table */
+  tableWrap: {
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+    borderRadius: 10,
+    overflow: "hidden",
+    marginBottom: 12,
+  },
+  tableHeader: {
+    flexDirection: "row",
+    backgroundColor: "#f3f4f6",
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#e5e7eb",
+  },
+  th: { fontWeight: "700", color: "#111827" },
+  tr: {
+    flexDirection: "row",
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#f1f5f9",
+  },
+  td: { color: "#111827" },
+  colName: { flex: 2 },
+  colQty: { flex: 0.6, textAlign: "center" as const },
+  colPrice: { flex: 0.9, textAlign: "right" as const },
+  tableScroll: { maxHeight: 220 },
 
   itemBox: {
     backgroundColor: "#f3f3f3",
@@ -458,10 +778,7 @@ const styles = StyleSheet.create({
   modalTitle: { fontSize: 18, fontWeight: "700" },
 
   // gallery thumbs
-  thumbWrap: {
-    flex: 1 / 3,
-    position: "relative",
-  },
+  thumbWrap: { flex: 1 / 3, position: "relative" },
   thumb: {
     width: "100%",
     aspectRatio: 1,
